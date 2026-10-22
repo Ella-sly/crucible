@@ -2,13 +2,18 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+use std::time::Duration;
+
 use crate::services::tracing::TracingService;
+use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
+use redis::aio::MultiplexedConnection;
 use redis::{AsyncCommands, Client as RedisClient};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use thiserror::Error;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument, warn, Instrument};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -42,55 +47,135 @@ pub struct FeatureFlag {
 // FeatureFlagService
 // ---------------------------------------------------------------------------
 
+/// Upper bound on how long `is_enabled` waits for Redis before treating it as
+/// unavailable and moving on to the next source.
+const REDIS_TIMEOUT: Duration = Duration::from_millis(250);
+
 pub struct FeatureFlagService {
     db: PgPool,
     redis: RedisClient,
+    /// Last known value of every flag read or written by this process.
+    /// Swapped atomically so readers never block during an outage.
+    local: ArcSwap<HashMap<String, bool>>,
+    /// Static values used when neither Redis, PostgreSQL nor the local
+    /// snapshot can answer.
+    defaults: HashMap<String, bool>,
 }
 
 impl FeatureFlagService {
     pub fn new(db: PgPool, redis: RedisClient) -> Self {
-        Self { db, redis }
+        Self::with_defaults(db, redis, HashMap::new())
     }
 
+    pub fn with_defaults(db: PgPool, redis: RedisClient, defaults: HashMap<String, bool>) -> Self {
+        Self {
+            db,
+            redis,
+            local: ArcSwap::from_pointee(HashMap::new()),
+            defaults,
+        }
+    }
+
+    /// Resolves a flag from Redis, then PostgreSQL. Backend failures are
+    /// logged and degrade to the local snapshot, then the static defaults;
+    /// the backend error is only returned when no fallback value exists.
     #[instrument(skip(self), fields(service.name = "FeatureFlagService", service.method = "is_enabled"))]
     pub async fn is_enabled(&self, key: &str) -> Result<bool, FlagError> {
         let cache_key = format!("flag:{key}");
 
-        let redis_span = TracingService::redis_command_span("GET", Some(&cache_key));
-        let _redis_enter = redis_span.enter();
-        let mut conn = self.redis.get_multiplexed_async_connection().await?;
-        let cached: Option<String> = conn.get(&cache_key).await?;
-        drop(_redis_enter);
-
-        if let Some(val) = cached {
-            debug!(key = %key, "Feature flag cache hit");
-            return Ok(val == "1");
-        }
+        let mut conn = match self.redis_get(&cache_key).await {
+            Ok((_, Some(val))) => {
+                debug!(key = %key, "Feature flag cache hit");
+                let enabled = val == "1";
+                self.remember(key, Some(enabled));
+                return Ok(enabled);
+            }
+            Ok((conn, None)) => Some(conn),
+            Err(e) => {
+                warn!(key = %key, error = %e, "Redis unavailable for feature flag lookup");
+                None
+            }
+        };
 
         debug!(key = %key, "Feature flag cache miss – querying database");
-        
+
         let db_span = TracingService::db_query_span(
             "SELECT enabled FROM feature_flags WHERE key = $1",
             "postgres",
             "SELECT",
         );
-        let _db_enter = db_span.enter();
-        let row: Option<(bool,)> =
+        let row: Result<Option<(bool,)>, sqlx::Error> =
             sqlx::query_as("SELECT enabled FROM feature_flags WHERE key = $1")
                 .bind(key)
                 .fetch_optional(&self.db)
-                .await?;
-        drop(_db_enter);
+                .instrument(db_span)
+                .await;
 
         match row {
-            Some((enabled,)) => {
-                let val = if enabled { "1" } else { "0" };
-                let _: () = conn.set_ex(&cache_key, val, 300).await?;
-                debug!(key = %key, enabled = enabled, "Cached feature flag");
+            Ok(Some((enabled,))) => {
+                self.remember(key, Some(enabled));
+                if let Some(conn) = conn.as_mut() {
+                    let val = if enabled { "1" } else { "0" };
+                    let cached: Result<(), _> = conn.set_ex(&cache_key, val, 300).await;
+                    match cached {
+                        Ok(()) => debug!(key = %key, enabled = enabled, "Cached feature flag"),
+                        Err(e) => warn!(key = %key, error = %e, "Failed to cache feature flag"),
+                    }
+                }
                 Ok(enabled)
             }
-            None => Err(FlagError::NotFound(key.to_string())),
+            Ok(None) => {
+                self.remember(key, None);
+                self.defaults
+                    .get(key)
+                    .copied()
+                    .ok_or_else(|| FlagError::NotFound(key.to_string()))
+            }
+            Err(e) => {
+                warn!(key = %key, error = %e, "Database unavailable for feature flag lookup");
+                self.fallback(key).ok_or(FlagError::Database(e))
+            }
         }
+    }
+
+    async fn redis_get(
+        &self,
+        cache_key: &str,
+    ) -> Result<(MultiplexedConnection, Option<String>), FlagError> {
+        let lookup = async {
+            let mut conn = self.redis.get_multiplexed_async_connection().await?;
+            let cached: Option<String> = conn.get(cache_key).await?;
+            Ok::<_, FlagError>((conn, cached))
+        }
+        .instrument(TracingService::redis_command_span("GET", Some(cache_key)));
+
+        tokio::time::timeout(REDIS_TIMEOUT, lookup)
+            .await
+            .map_err(|_| FlagError::Internal("Redis lookup timed out".to_string()))?
+    }
+
+    /// Last known value for `key`, else its static default.
+    fn fallback(&self, key: &str) -> Option<bool> {
+        self.local
+            .load()
+            .get(key)
+            .copied()
+            .or_else(|| self.defaults.get(key).copied())
+    }
+
+    /// Records (or forgets, for `None`) the last known value of a flag.
+    fn remember(&self, key: &str, enabled: Option<bool>) {
+        if self.local.load().get(key).copied() == enabled {
+            return;
+        }
+        self.local.rcu(|current| {
+            let mut next = HashMap::clone(current);
+            match enabled {
+                Some(enabled) => next.insert(key.to_string(), enabled),
+                None => next.remove(key),
+            };
+            next
+        });
     }
 
     #[instrument(skip(self), fields(service.name = "FeatureFlagService", service.method = "get"))]
@@ -151,6 +236,7 @@ impl FeatureFlagService {
         .execute(&self.db)
         .await?;
 
+        self.remember(key, Some(enabled));
         self.invalidate_cache(key).await?;
         info!(key = %key, enabled = enabled, "Feature flag updated");
         Ok(())
@@ -167,6 +253,7 @@ impl FeatureFlagService {
             return Err(FlagError::NotFound(key.to_string()));
         }
 
+        self.remember(key, None);
         self.invalidate_cache(key).await?;
         info!(key = %key, "Feature flag deleted");
         Ok(())
@@ -240,5 +327,37 @@ mod tests {
         let flag: FeatureFlag = serde_json::from_str(json).unwrap();
         assert_eq!(flag.key, "beta");
         assert!(!flag.enabled);
+    }
+
+    /// Service whose Redis and PostgreSQL both refuse connections.
+    fn offline_service(defaults: HashMap<String, bool>) -> FeatureFlagService {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/crucible_test")
+            .unwrap();
+        let redis = RedisClient::open("redis://127.0.0.1:1/").unwrap();
+        FeatureFlagService::with_defaults(db, redis, defaults)
+    }
+
+    #[tokio::test]
+    async fn is_enabled_falls_back_to_static_default_when_backends_are_down() {
+        let service = offline_service(HashMap::from([("beta".to_string(), true)]));
+        assert!(service.is_enabled("beta").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_enabled_prefers_last_known_value_over_default() {
+        let service = offline_service(HashMap::from([("beta".to_string(), true)]));
+        service.remember("beta", Some(false));
+        assert!(!service.is_enabled("beta").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_enabled_errors_when_backends_are_down_and_no_fallback_exists() {
+        let service = offline_service(HashMap::new());
+        assert!(matches!(
+            service.is_enabled("unknown").await,
+            Err(FlagError::Database(_))
+        ));
     }
 }

@@ -3,7 +3,8 @@
 //! The service protects expensive build submission paths from repeated work by
 //! deriving a stable SHA-256 fingerprint from the request identity, acquiring a
 //! short-lived Redis lock with `SET NX EX`, and optionally persisting the
-//! deduplication record in PostgreSQL.
+//! deduplication record in PostgreSQL. Workers keep the lock alive for long
+//! compilations with [`BuildDedupService::spawn_lock_heartbeat`].
 
 use axum::{
     extract::State,
@@ -19,6 +20,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
@@ -401,6 +403,65 @@ impl BuildDedupService {
         Ok(())
     }
 
+    /// Resets the in-flight lock TTL if `request_id` still owns it.
+    ///
+    /// Returns `false` when the lock has expired or belongs to another
+    /// request, in which case the caller no longer holds deduplication.
+    pub async fn extend_lock(
+        &self,
+        fingerprint: &str,
+        request_id: Uuid,
+    ) -> Result<bool, DedupError> {
+        let mut conn = self.redis.get_multiplexed_async_connection().await?;
+        let extended = redis::Script::new(
+            r#"
+            if redis.call("GET", KEYS[1]) == ARGV[1] then
+                return redis.call("EXPIRE", KEYS[1], ARGV[2])
+            end
+            return 0
+            "#,
+        )
+        .key(self.lock_key(fingerprint))
+        .arg(request_id.to_string())
+        .arg(self.config.lock_ttl_seconds)
+        .invoke_async::<i32>(&mut conn)
+        .await?;
+        Ok(extended == 1)
+    }
+
+    /// Keeps the in-flight lock alive for as long as the returned guard lives.
+    ///
+    /// Build workers should hold the guard for the full compilation so that
+    /// builds outliving `lock_ttl_seconds` are not compiled a second time.
+    /// The lock is renewed every third of its TTL; dropping the guard stops
+    /// renewal without releasing the lock (use `complete` or `fail` for that).
+    pub fn spawn_lock_heartbeat(&self, fingerprint: &str, request_id: Uuid) -> LockHeartbeat {
+        let service = self.clone();
+        let fingerprint = fingerprint.to_string();
+        let interval = heartbeat_interval(self.config.lock_ttl_seconds);
+
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match service.extend_lock(&fingerprint, request_id).await {
+                    Ok(true) => debug!(%fingerprint, %request_id, "renewed build dedup lock"),
+                    Ok(false) => {
+                        warn!(%fingerprint, %request_id, "build dedup lock lost; stopping heartbeat");
+                        return;
+                    }
+                    // Transient Redis failure: retry on the next tick while the
+                    // remaining TTL still covers us.
+                    Err(e) => warn!(%fingerprint, %request_id, error = %e, "failed to renew build dedup lock"),
+                }
+            }
+        });
+
+        LockHeartbeat { task }
+    }
+
     fn lock_key(&self, fingerprint: &str) -> String {
         format!("{}:{}:lock", self.config.namespace, fingerprint)
     }
@@ -461,6 +522,32 @@ impl BuildDedupService {
         .await?;
         Ok(())
     }
+}
+
+/// Guard returned by [`BuildDedupService::spawn_lock_heartbeat`]; renewal
+/// stops when it is dropped.
+#[derive(Debug)]
+pub struct LockHeartbeat {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl LockHeartbeat {
+    /// Whether the heartbeat stopped on its own because the lock was lost.
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+}
+
+impl Drop for LockHeartbeat {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Renewal period for a lock with the given TTL: a third of the TTL, so two
+/// consecutive renewals can fail before the lock expires.
+fn heartbeat_interval(lock_ttl_seconds: usize) -> Duration {
+    Duration::from_millis((lock_ttl_seconds as u64 * 1000 / 3).max(1000))
 }
 
 /// Shared Axum state for deduplicated build request routes.
@@ -586,6 +673,13 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_renews_well_before_lock_expiry() {
+        assert_eq!(heartbeat_interval(30), Duration::from_secs(10));
+        assert_eq!(heartbeat_interval(900), Duration::from_secs(300));
+        assert_eq!(heartbeat_interval(1), Duration::from_secs(1));
+    }
+
+    #[test]
     fn handler_router_can_be_constructed() {
         let db = PgPoolOptions::new()
             .connect_lazy("postgres://postgres:postgres@localhost/crucible_test")
@@ -668,5 +762,39 @@ mod tests {
         assert_eq!(duplicate.status, DedupStatus::Duplicate);
         assert_eq!(duplicate.request_id, accepted.request_id);
         assert!(duplicate.replayable);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL and Redis test services"]
+    async fn heartbeat_keeps_lock_alive_past_its_ttl() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/crucible_test".to_string());
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+        let db = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        BuildDedupService::ensure_schema(&db).await.unwrap();
+
+        let redis = redis::Client::open(redis_url).unwrap();
+        let config = DedupConfig {
+            namespace: format!("{}:test:{}", DEFAULT_NAMESPACE, Uuid::new_v4()),
+            result_ttl_seconds: 60,
+            lock_ttl_seconds: 3,
+            queue_name: format!("build:requests:test:{}", Uuid::new_v4()),
+        };
+        let service = BuildDedupService::with_config(db, redis, config);
+        let request = sample_request().idempotency_key(Uuid::new_v4().to_string());
+
+        let accepted = service.check_or_register(request.clone()).await.unwrap();
+        let heartbeat = service.spawn_lock_heartbeat(&accepted.fingerprint, accepted.request_id);
+        tokio::time::sleep(Duration::from_secs(7)).await;
+
+        let duplicate = service.check_or_register(request).await.unwrap();
+        assert_eq!(duplicate.status, DedupStatus::InProgress);
+        assert_eq!(duplicate.request_id, accepted.request_id);
+        assert!(!heartbeat.is_finished());
     }
 }

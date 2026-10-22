@@ -94,6 +94,49 @@ pub struct MetricsSummary {
     pub latest_timestamp: Option<DateTime<Utc>>,
 }
 
+/// Process-lifetime cumulative totals.
+///
+/// Accumulated as `u128` with saturating addition: a `u64` stroop counter
+/// wraps after ~1.8e19 stroops (~1.8 trillion XLM), which a long-running
+/// production process can reach, and wrapping would silently report a tiny
+/// total. Saturating at `u128::MAX` is unreachable in practice and never
+/// panics or wraps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CumulativeTotals {
+    /// Total transaction volume, in stroops.
+    #[serde(with = "u128_as_string")]
+    pub volume_stroops: u128,
+    /// Total fees paid, in stroops.
+    #[serde(with = "u128_as_string")]
+    pub fee_stroops: u128,
+    /// Number of transactions accumulated.
+    pub transaction_count: u64,
+}
+
+impl CumulativeTotals {
+    pub fn add_transaction(&mut self, volume_stroops: u64, fee_stroops: u64) {
+        self.volume_stroops = self.volume_stroops.saturating_add(u128::from(volume_stroops));
+        self.fee_stroops = self.fee_stroops.saturating_add(u128::from(fee_stroops));
+        self.transaction_count = self.transaction_count.saturating_add(1);
+    }
+}
+
+/// JSON numbers lose precision past 2^53, so `u128` totals are serialized as
+/// decimal strings.
+mod u128_as_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &u128, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(value)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u128, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 // ─── Service ─────────────────────────────────────────────────────────────────
 // ---------------------------------------------------------------------------
 // Service
@@ -101,6 +144,7 @@ pub struct MetricsSummary {
 pub struct BusinessMetricsService {
     db: PgPool,
     cache: Arc<RwLock<HashMap<String, Vec<BusinessMetric>>>>,
+    totals: Arc<RwLock<CumulativeTotals>>,
 }
 
 impl BusinessMetricsService {
@@ -108,7 +152,21 @@ impl BusinessMetricsService {
         Self {
             db,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            totals: Arc::new(RwLock::new(CumulativeTotals::default())),
         }
+    }
+
+    /// Adds one transaction's volume and fee to the cumulative totals.
+    pub async fn record_transaction_totals(&self, volume_stroops: u64, fee_stroops: u64) {
+        self.totals
+            .write()
+            .await
+            .add_transaction(volume_stroops, fee_stroops);
+    }
+
+    /// Snapshot of the cumulative volume and fee totals.
+    pub async fn cumulative_totals(&self) -> CumulativeTotals {
+        *self.totals.read().await
     }
 
     /// Record a new business metric with the given parameters.
@@ -664,6 +722,43 @@ mod tests {
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("42"));
+    }
+
+    #[test]
+    fn test_cumulative_totals_exceed_u64_without_wrapping() {
+        let mut totals = CumulativeTotals::default();
+        totals.add_transaction(u64::MAX, u64::MAX);
+        totals.add_transaction(u64::MAX, 1);
+
+        assert_eq!(totals.volume_stroops, u128::from(u64::MAX) * 2);
+        assert_eq!(totals.fee_stroops, u128::from(u64::MAX) + 1);
+        assert_eq!(totals.transaction_count, 2);
+    }
+
+    #[test]
+    fn test_cumulative_totals_saturate_at_u128_max() {
+        let mut totals = CumulativeTotals {
+            volume_stroops: u128::MAX - 1,
+            fee_stroops: u128::MAX,
+            transaction_count: u64::MAX,
+        };
+        totals.add_transaction(10, 10);
+
+        assert_eq!(totals.volume_stroops, u128::MAX);
+        assert_eq!(totals.fee_stroops, u128::MAX);
+        assert_eq!(totals.transaction_count, u64::MAX);
+    }
+
+    #[test]
+    fn test_cumulative_totals_serialize_losslessly() {
+        let totals = CumulativeTotals {
+            volume_stroops: u128::MAX,
+            fee_stroops: 42,
+            transaction_count: 1,
+        };
+        let json = serde_json::to_string(&totals).unwrap();
+        assert!(json.contains(&format!("\"{}\"", u128::MAX)));
+        assert_eq!(serde_json::from_str::<CumulativeTotals>(&json).unwrap(), totals);
     }
 
     #[test]
